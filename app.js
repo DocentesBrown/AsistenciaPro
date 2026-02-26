@@ -5,6 +5,20 @@ const e = React.createElement;
 const LS_KEY = 'agenda_estudiantes_sin_google_v5';
 const TEACHER_LS_KEY = 'teacher_profile_v1';
 
+function readStoredSessionSync(){
+  try { return JSON.parse(localStorage.getItem('session_user_v1')) || null; }
+  catch { return null; }
+}
+function localScopeSuffix(){
+  const s = readStoredSessionSync();
+  const raw = (s && (s.correo || s.usuario)) ? String(s.correo || s.usuario) : '';
+  return raw ? raw.trim().toLowerCase() : '';
+}
+function scopedLocalKey(baseKey){
+  const suffix = localScopeSuffix();
+  return suffix ? `${baseKey}__${suffix}` : baseKey;
+}
+
 function uid(prefix) { prefix = prefix || 'id'; return prefix + '_' + Math.random().toString(36).slice(2,9); }
 function safeStats(stats) { return stats && typeof stats === 'object' ? stats : { present:0, absent:0, later:0 }; }
 function pct(stats) { const s = safeStats(stats); const d = (s.present||0) + (s.absent||0); return d ? Math.round((s.present/d)*100) : 0; }
@@ -23,7 +37,7 @@ function avg(arr){
 }
 function loadState() {
   try {
-    const raw = localStorage.getItem(LS_KEY);
+    const raw = localStorage.getItem(scopedLocalKey(LS_KEY));
     const base = { courses:{}, selectedCourseId:null, selectedDate: todayStr() };
     if (!raw) return base;
     const parsed = JSON.parse(raw);
@@ -36,14 +50,14 @@ function loadState() {
     return { courses:{}, selectedCourseId:null, selectedDate: todayStr() };
   }
 }
-function saveState(state){ localStorage.setItem(LS_KEY, JSON.stringify(state)); }
+function saveState(state){ localStorage.setItem(scopedLocalKey(LS_KEY), JSON.stringify(state)); }
 
-// Perfil de profe (dispositivo)
+// Perfil de profe (por usuario/dispositivo)
 function loadTeacher(){
-  try { return JSON.parse(localStorage.getItem(TEACHER_LS_KEY)) || { name:'', article:'la' }; }
+  try { return JSON.parse(localStorage.getItem(scopedLocalKey(TEACHER_LS_KEY))) || { name:'', article:'la' }; }
   catch { return { name:'', article:'la' }; }
 }
-function saveTeacher(t){ localStorage.setItem(TEACHER_LS_KEY, JSON.stringify(t)); }
+function saveTeacher(t){ localStorage.setItem(scopedLocalKey(TEACHER_LS_KEY), JSON.stringify(t)); }
 
 function sanitizePhone(phoneRaw=''){
   // Normaliza números de AR para WhatsApp (wa.me)
@@ -67,6 +81,65 @@ function buildRiskMessage(course, student, attendancePct, promedio, teacher){
   return encodeURIComponent(msg);
 }
 
+
+
+// ====== Supabase helpers (multi-dispositivo) ======
+function hasSupabase(){ return !!(window.sb && window.sb.auth); }
+async function sbGetUser(){ const { data, error } = await window.sb.auth.getUser(); if(error) throw error; return data.user || null; }
+async function sbSignIn(email, password){
+  if(!hasSupabase()) throw new Error('Falta configurar Supabase en index.html');
+  const { error } = await window.sb.auth.signInWithPassword({ email, password });
+  if(error) throw error;
+}
+async function sbSignOut(){ if(!hasSupabase()) return; const { error } = await window.sb.auth.signOut(); if(error) throw error; }
+async function sbResetPassword(email){
+  if(!hasSupabase()) throw new Error('Supabase no configurado.');
+  const { error } = await window.sb.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin + window.location.pathname });
+  if(error) throw error;
+}
+async function sbEnsureStateRow(){
+  const user = await sbGetUser();
+  if(!user) throw new Error('No hay sesión');
+  const { data, error } = await window.sb.from('user_app_state').select('user_id').eq('user_id', user.id).maybeSingle();
+  if(error) throw error;
+  if(!data){
+    const { error:insErr } = await window.sb.from('user_app_state').insert({
+      user_id:user.id,
+      app_state:{ courses:{}, selectedCourseId:null, selectedDate: todayStr() },
+      teacher_profile:{ name:'', article:'la' }
+    });
+    if(insErr) throw insErr;
+  }
+}
+function isEmptyAppState(st){
+  return !st || !st.courses || Object.keys(st.courses).length === 0;
+}
+async function sbLoadRemoteData(){
+  const user = await sbGetUser();
+  if(!user) throw new Error('No hay sesión');
+  const { data, error } = await window.sb.from('user_app_state').select('app_state, teacher_profile').eq('user_id', user.id).single();
+  if(error) throw error;
+  const rawState = data?.app_state || {};
+  return {
+    state:{
+      courses: rawState.courses || {},
+      selectedCourseId: rawState.selectedCourseId || null,
+      selectedDate: todayStr()
+    },
+    teacher: data?.teacher_profile || { name:'', article:'la' },
+    remoteEmpty: isEmptyAppState(rawState)
+  };
+}
+async function sbSaveRemoteState(state, teacher){
+  const user = await sbGetUser();
+  if(!user) return;
+  const { error } = await window.sb.from('user_app_state').upsert({
+    user_id:user.id,
+    app_state:{ courses:state?.courses || {}, selectedCourseId:state?.selectedCourseId || null, selectedDate: state?.selectedDate || todayStr() },
+    teacher_profile:{ name: teacher?.name || '', article: teacher?.article || 'la' }
+  }, { onConflict:'user_id' });
+  if(error) throw error;
+}
 
 // ====== Auth helpers ======
 const SESSION_KEY = 'session_user_v1';
@@ -119,20 +192,34 @@ function LoginScreen({ onLogin }){
     ev && ev.preventDefault();
     setError(''); setLoading(true);
     try {
-      const users = await fetchUsers();
-      const found = users.find(u => (u.usuario||'').toLowerCase() === (usuario||'').toLowerCase());
-      if(!found){ setError('Usuario no encontrado.'); return; }
-      if(String(found.contrasena||'') !== String(password||'')){ setError('Contraseña incorrecta.'); return; }
-      saveSession({ usuario: found.usuario, correo: found.correo || '' });
+      if(hasSupabase()){
+        await sbSignIn(usuario, password);
+        const user = await sbGetUser();
+        saveSession({ usuario: user?.email || usuario, correo: user?.email || usuario });
+      } else {
+        const users = await fetchUsers();
+        const found = users.find(u => (u.usuario||'').toLowerCase() === (usuario||'').toLowerCase());
+        if(!found){ setError('Usuario no encontrado.'); return; }
+        if(String(found.contrasena||'') !== String(password||'')){ setError('Contraseña incorrecta.'); return; }
+        saveSession({ usuario: found.usuario, correo: found.correo || '' });
+      }
       onLogin && onLogin();
     } catch(err){
-      setError(err && err.message ? err.message : 'Error cargando usuarios.');
+      setError(err && err.message ? err.message : 'No se pudo iniciar sesión.');
     } finally {
       setLoading(false);
     }
   }
 
   function forgotPassword(){
+    if(hasSupabase()){
+      const correo = (prompt('Ingresá tu correo (el mismo con el que iniciás sesión):', usuario) || '').trim();
+      if(!correo) return;
+      sbResetPassword(correo)
+        .then(()=> alert('Te enviamos un correo para restablecer tu contraseña.'))
+        .catch(err => alert('No se pudo enviar el mail: ' + ((err && err.message) || 'error')));
+      return;
+    }
     const api = (window.PASSWORD_API_URL || '').trim();
     if(api){
       const correo = prompt('Ingresá tu correo (para enviarte un código):') || '';
@@ -146,6 +233,10 @@ function LoginScreen({ onLogin }){
   }
 
   function changePassword(){
+    if(hasSupabase()){
+      alert('Usá “Olvidé mi contraseña” para cambiar la clave desde Supabase.');
+      return;
+    }
     const api = (window.PASSWORD_API_URL || '').trim();
     if(api){
       const actual = prompt('Tu contraseña actual:') || '';
@@ -163,7 +254,7 @@ function LoginScreen({ onLogin }){
     e('div', { className:'w-full max-w-sm bg-white rounded-3xl border shadow p-6', style:{ borderColor:'#d7dbe0' } },
       e('div', { className:'text-center mb-4' },
         e('div', { className:'text-2xl font-bold', style:{ color:'#24496e' } }, 'Tomador de lista'),
-        e('div', { className:'text-sm text-slate-600' }, 'Ingresá con tu usuario')
+        e('div', { className:'text-sm text-slate-600' }, 'Ingresá con tu correo de acceso')
       ),
       e('form', { onSubmit:submit, className:'space-y-3' },
         e('div', null,
@@ -243,8 +334,46 @@ function ChangePasswordPanel({ usuario, onClose }){
 
 function AppShell(){
   const [sess, setSess] = useState(loadSession());
-  function handleLogout(){ clearSession(); setSess(null); }
+  const [loading, setLoading] = useState(!!hasSupabase());
+
+  useEffect(() => {
+    if(!hasSupabase()) return;
+    let mounted = true;
+    window.sb.auth.getSession().then(({ data }) => {
+      if(!mounted) return;
+      const session = (data && data.session) || null;
+      if(session){
+        saveSession({ usuario: session.user?.email || '', correo: session.user?.email || '' });
+        setSess({ usuario: session.user?.email || '', correo: session.user?.email || '' });
+      } else {
+        clearSession();
+        setSess(null);
+      }
+      setLoading(false);
+    }).catch(() => setLoading(false));
+    const listener = window.sb.auth.onAuthStateChange((_ev, session) => {
+      if(session){
+        saveSession({ usuario: session.user?.email || '', correo: session.user?.email || '' });
+        setSess({ usuario: session.user?.email || '', correo: session.user?.email || '' });
+      } else {
+        clearSession();
+        setSess(null);
+      }
+      setLoading(false);
+    });
+    return () => { mounted = false; try { listener?.data?.subscription?.unsubscribe?.(); } catch(_){} };
+  }, []);
+
+  async function handleLogout(){
+    try { if(hasSupabase()) await sbSignOut(); } catch(_){}
+    clearSession(); setSess(null);
+  }
   function handleLogged(){ setSess(loadSession()); }
+
+  if(loading){
+    return e('div', { className:'min-h-dvh flex items-center justify-center text-slate-600' }, 'Cargando...');
+  }
+
   return sess
     ? e('div', null,
         e('div', { className:'w-full flex justify-end p-2 text-sm' },
@@ -253,7 +382,7 @@ function AppShell(){
             e('button', { onClick:handleLogout, className:'px-2 py-1 rounded', style:{ background:'#f3efdc', color:'#24496e' } }, 'Cerrar sesión')
           )
         ),
-        e(App, { session: sess })
+        e(App, { session: sess, key: (sess && sess.user && sess.user.id) ? sess.user.id : 'app' })
       )
     : e(LoginScreen, { onLogin: handleLogged });
 }
@@ -595,14 +724,14 @@ function AbsencesModal({ open, student, onClose, onApplyChange }) {
   if(!open || !student) return null;
   const history = (student.history || []).map(h => h.id ? h : Object.assign({}, h, { id: uid('hist') }));
   const rows = history
-    .filter(h => h.status === 'absent' || h.status === 'tarde')
+    .filter(h => h.status === 'absent' || h.status === 'tarde' || h.status === 'later')
     .slice()
     .sort((a,b)=>(a.date||'').localeCompare(b.date||''));
 
   const totalAusentes = rows.filter(r => r.status === 'absent').length;
 
   function labelFor(r){
-    if(r.status === 'tarde') return 'Tarde';
+    if(r.status === 'tarde' || r.status === 'later') return 'Tarde';
     if(r.status === 'absent' && r.reason === 'justificada') return 'Justificada';
     return 'Ausente';
     }
@@ -775,6 +904,8 @@ function App() {
   // Perfil del/la profe
   const [teacher, setTeacher] = useState(loadTeacher());
   const [teacherOpen, setTeacherOpen] = useState(false);
+  const [remoteReady, setRemoteReady] = useState(!hasSupabase());
+  const [didInitialRemoteLoad, setDidInitialRemoteLoad] = useState(false);
 
   // Modal de notas
   const [gradesOpen, setGradesOpen] = useState(false);
@@ -790,6 +921,38 @@ function App() {
 
   useEffect(() => { saveState(state); }, [state]);
 
+  // Carga inicial desde Supabase (sin romper datos locales)
+  useEffect(() => {
+    let mounted = true;
+    if(!hasSupabase()){ setRemoteReady(true); setDidInitialRemoteLoad(true); return; }
+    (async () => {
+      try {
+        await sbEnsureStateRow();
+        const remote = await sbLoadRemoteData();
+        if(!mounted) return;
+        const localState = loadState();
+        const localTeacher = loadTeacher();
+        const localHasData = !isEmptyAppState(localState);
+        if(remote && remote.remoteEmpty && localHasData){
+          const subir = window.confirm('Encontré datos en este dispositivo y la nube está vacía. ¿Querés subir estos datos a tu cuenta?');
+          if(subir){
+            await sbSaveRemoteState(localState, localTeacher);
+          } else {
+            // usar servidor vacío, no hacemos nada
+          }
+        } else {
+          if(remote && remote.state) setState(remote.state);
+          if(remote && remote.teacher) setTeacher(remote.teacher);
+        }
+      } catch(err){
+        console.warn('No se pudo cargar de Supabase, se usan datos locales.', err);
+      } finally {
+        if(mounted){ setRemoteReady(true); setDidInitialRemoteLoad(true); }
+      }
+    })();
+    return () => { mounted = false; };
+  }, []);
+
   // Primer inicio: pedir nombre
   useEffect(() => {
     if(!(teacher && teacher.name)){
@@ -797,6 +960,15 @@ function App() {
     }
   }, []);
   useEffect(() => { if(teacher) saveTeacher(teacher); }, [teacher]);
+
+  // Guardado remoto con debounce
+  useEffect(() => {
+    if(!hasSupabase() || !remoteReady || !didInitialRemoteLoad) return;
+    const t = setTimeout(() => {
+      sbSaveRemoteState(state, teacher).catch(err => console.warn('No se pudo sincronizar con Supabase:', err));
+    }, 500);
+    return () => clearTimeout(t);
+  }, [state, teacher, remoteReady, didInitialRemoteLoad]);
 
   // Exponer función para abrir Exportar/Importar desde el footer
   useEffect(() => {
@@ -969,36 +1141,53 @@ function App() {
       const st = Object.assign({}, students[studentId]);
       const stats = safeStats(st.stats);
       const hist = (st.history || []).slice();
+
+      // Compatibilidad: algunos historiales viejos no tenían id.
+      // Les asignamos id persistente para que el cambio quede guardado.
+      for (let i = 0; i < hist.length; i++) {
+        if (!hist[i].id) hist[i] = Object.assign({}, hist[i], { id: uid('hist') });
+      }
+
       const idx = hist.findIndex(h => h.id === histId);
       if (idx === -1) return s;
 
       const entry = Object.assign({}, hist[idx]);
+      const currentStatus = entry.status === 'tarde' ? 'later' : entry.status; // normalizar legado
 
       if (reason === 'erronea') {
-        if (entry.status === 'absent' && stats.absent > 0) stats.absent -= 1;
-        if (entry.status === 'tarde'  && stats.later  > 0) stats.later  -= 1;
+        if (currentStatus === 'absent' && (stats.absent || 0) > 0) stats.absent -= 1;
+        if (currentStatus === 'later'  && (stats.later  || 0) > 0) stats.later  -= 1;
 
-        // Reetiquetar como presente y sumar 1 a presentes
+        // Reetiquetar como presente y sumar 1 a presentes (solo si antes no lo era)
+        if (currentStatus !== 'present') stats.present = (stats.present || 0) + 1;
         entry.status = 'present';
         delete entry.reason;
-        stats.present = (stats.present || 0) + 1;
         hist[idx] = entry;
       } else if (reason === 'tarde') {
-        // Contar 'tarde' también como presencia
-        if (entry.status === 'absent') {
-          if (stats.absent > 0) stats.absent -= 1;
+        // Tarde cuenta como presencia
+        if (currentStatus === 'absent' && (stats.absent || 0) > 0) {
+          stats.absent -= 1;
         }
         // Sumar tardanza si aún no lo era
-        if (entry.status !== 'tarde') {
+        if (currentStatus !== 'later') {
           stats.later = (stats.later || 0) + 1;
         }
-        // ✅ Siempre suma 1 a presentes (criterio pedido por Naty)
-        stats.present = (stats.present || 0) + 1;
+        // Sumar presentes solo si venía de ausente (para evitar duplicados al reaplicar)
+        if (currentStatus === 'absent') {
+          stats.present = (stats.present || 0) + 1;
+        }
 
-        entry.status = 'tarde';
+        entry.status = 'later';
         delete entry.reason;
         hist[idx] = entry;
       } else if (reason === 'justificada') {
+        // Sigue contando como ausencia, solo marca el motivo
+        if (currentStatus === 'later') {
+          // Si estaba tarde y la pasan a justificada, revierte tardanza/presencia y pasa a ausencia
+          if ((stats.later || 0) > 0) stats.later -= 1;
+          if ((stats.present || 0) > 0) stats.present -= 1;
+          stats.absent = (stats.absent || 0) + 1;
+        }
         entry.status = 'absent';
         entry.reason = 'justificada';
         hist[idx] = entry;
